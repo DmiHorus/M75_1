@@ -1,0 +1,2378 @@
+{
+  "name": "ADR Generation Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 1. Webhook Trigger\nPOST `/webhook/adr-meeting-completed`\nCanonical fields: `meeting_id`, `recording_url`, `participants`, `start_time`, `project_id`, `jira_epic_id`.\nAlso accepts Zoom `recording.completed`.\nResponds 202 immediately so Zoom/Teams do not time out.",
+        "height": 240,
+        "width": 300,
+        "color": 5
+      },
+      "id": "e29b2f50-2efb-4b94-a3f3-8b3504f73bda",
+      "name": "Note 1 Webhook",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2–3. Recording + Whisper STT\nDownloads the recording, then calls Whisper (`verbose_json`) to keep timestamps.\n`speaker_id` is preserved when the STT/diarization API provides it; otherwise participant ids are used as a fallback.\nInline `transcript` skips download/STT for dry-runs.",
+        "height": 260,
+        "width": 320,
+        "color": 6
+      },
+      "id": "06444d97-0be2-4f14-a439-ed54bdadbfe3",
+      "name": "Note 2 Recording STT",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        780,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 4. Preprocess / chunking\nStrips fillers, `[inaudible]`, recording notices; normalizes whitespace; splits oversized transcripts into overlapping-safe chunks.",
+        "height": 200,
+        "width": 280,
+        "color": 4
+      },
+      "id": "5a1fc9f9-2cc0-4703-aee2-05457c8656b5",
+      "name": "Note 3 Preprocess",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 5. Jira / Confluence context\nSeparate integration nodes. Failures **do not abort** the workflow: ADR is generated with `INCOMPLETE CONTEXT`.",
+        "height": 200,
+        "width": 300,
+        "color": 3
+      },
+      "id": "41726128-ff91-4dfe-a20d-467174aa63af",
+      "name": "Note 4 Context",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1960,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 6. LangChain extraction\nFour Information Extractor nodes (n8n LangChain, no external Langflow runtime):\n1. Requirements\n2. Constraints\n3. Alternatives\n4. Decisions (+ questions/risks)\nKeeps discussed options away from accepted decisions.",
+        "height": 280,
+        "width": 320,
+        "color": 2
+      },
+      "id": "7310270d-8277-413e-a7c2-c6912b418e20",
+      "name": "Note 5 Extraction",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3000,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 7–9. Aggregate → Generate → Validate\nDedup, match alternatives to decisions, detect contradictions.\nADR JSON is parsed; invalid JSON is retried once, then the workflow stops with a notification (no crash, no publish).\nNo explicit decision → status **Needs clarification**.",
+        "height": 280,
+        "width": 340,
+        "color": 7
+      },
+      "id": "1ddf85c1-c00b-48c4-a310-ce56b2030768",
+      "name": "Note 6 Aggregate ADR",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3920,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 10–11. Human review then publish\nWait-for-form (`Approve` / `Reject` / `Request changes`) is on the only path to Confluence, Notion, Jira and Slack/Teams.\nPublication cannot run unless the architect approves.",
+        "height": 240,
+        "width": 340,
+        "color": 1
+      },
+      "id": "0da32ddb-adf3-4ad2-a5ed-2c948f8692c6",
+      "name": "Note 7 HITL Publish",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        5880,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "adr-meeting-completed",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "1d5fba44-2a41-4971-ac72-27cd9bc327df",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        400
+      ],
+      "webhookId": "adr-meeting-completed"
+    },
+    {
+      "parameters": {
+        "jsCode": "function asArray(value) {\n  if (value == null || value === '') return [];\n  return Array.isArray(value) ? value : [value];\n}\n\nfunction normalizeParticipant(participant) {\n  if (typeof participant === 'string') {\n    return { id: participant, name: participant, email: '' };\n  }\n  const name =\n    participant.name ||\n    participant.user_name ||\n    participant.displayName ||\n    participant.email ||\n    String(participant.id || 'unknown');\n  return {\n    id: String(participant.id || participant.user_id || participant.email || name),\n    name,\n    email: participant.email || participant.user_email || '',\n  };\n}\n\nfunction pickRecordingUrl(payload) {\n  if (payload.recording_url) return payload.recording_url;\n  if (payload.download_url) return payload.download_url;\n  const files =\n    payload.payload?.object?.recording_files ||\n    payload.object?.recording_files ||\n    payload.recording_files ||\n    [];\n  const preferred =\n    files.find((file) => /mp3|m4a|wav|mp4|ogg/i.test(String(file.file_type || file.fileType || file.extension || ''))) ||\n    files[0];\n  return preferred?.download_url || preferred?.play_url || preferred?.url || '';\n}\n\nfunction normalizeWebhookPayload(raw) {\n  const body = raw?.body && typeof raw.body === 'object' ? raw.body : raw || {};\n  const zoomObj = body.payload?.object || (body.event && body.payload ? body.payload.object : null);\n  const teams = body.meeting || body.value || null;\n\n  const meetingId = String(\n    body.meeting_id ||\n      body.meetingId ||\n      zoomObj?.uuid ||\n      zoomObj?.id ||\n      teams?.id ||\n      body.id ||\n      '',\n  );\n\n  const participants = asArray(\n    body.participants || zoomObj?.participants || body.attendees || teams?.participants || [],\n  ).map(normalizeParticipant);\n\n  const transcript = body.transcript || body.transcript_text || body.text || '';\n  const transcriptUrl = body.transcript_url || body.transcriptUrl || '';\n  const recordingUrl = pickRecordingUrl(body) || pickRecordingUrl(zoomObj || {}) || body.recordingUrl || '';\n\n  let sourceKind = 'recording';\n  if (String(transcript).trim()) sourceKind = 'inline_transcript';\n  else if (transcriptUrl) sourceKind = 'transcript_url';\n\n  return {\n    meeting_id: meetingId || `meeting-${Date.now()}`,\n    recording_url: recordingUrl,\n    transcript: String(transcript || ''),\n    transcript_url: String(transcriptUrl || ''),\n    participants,\n    start_time: body.start_time || zoomObj?.start_time || body.start || teams?.startDateTime || null,\n    project_id: String(body.project_id || body.projectId || ''),\n    jira_epic_id: String(body.jira_epic_id || body.jiraEpicId || body.epic_id || ''),\n    title: body.title || zoomObj?.topic || body.topic || teams?.subject || '',\n    source: zoomObj ? 'zoom' : body.source || (teams ? 'teams' : 'canonical'),\n    source_kind: sourceKind,\n    raw_event: body.event || null,\n  };\n}\n\nconst meeting = normalizeWebhookPayload($input.first().json);\nreturn [{ json: meeting }];\n"
+      },
+      "id": "e3a95a9f-ffcb-412f-a082-0e4a0dd0c781",
+      "name": "Normalize Meeting Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "e0a3d4f5-4f22-475f-ac97-fab5b0dbfcc5",
+                    "leftValue": "={{ $json.source_kind }}",
+                    "rightValue": "inline_transcript",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "inline_transcript"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "ec943906-0536-4930-ac81-3b0cef422456",
+                    "leftValue": "={{ $json.source_kind }}",
+                    "rightValue": "transcript_url",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "transcript_url"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "74baf926-fd4c-480d-aaa2-255553243eec",
+                    "leftValue": "={{ $json.source_kind }}",
+                    "rightValue": "recording",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "recording"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f03d7514-6cb6-40b6-afad-e0c5d8cb90e5",
+      "name": "Switch Transcript Source",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        560,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function parseSttResponse(stt, participants = []) {\n  const payload = stt || {};\n  const segments = payload.segments || payload.utterances || payload.chunks || [];\n  const fallbackSpeaker = (index) => {\n    if (!participants.length) return null;\n    return participants[index % participants.length]?.id || participants[index % participants.length]?.name || null;\n  };\n\n  const utterances = segments\n    .map((segment, index) => {\n      const speakerId =\n        segment.speaker_id ||\n        segment.speaker ||\n        segment.spk ||\n        (segment.speaker_label != null ? String(segment.speaker_label) : null) ||\n        fallbackSpeaker(index);\n      return {\n        speaker_id: speakerId == null ? null : String(speakerId),\n        start: segment.start ?? segment.start_time ?? segment.offset ?? null,\n        end: segment.end ?? segment.end_time ?? null,\n        text: String(segment.text || segment.transcript || segment.content || '').trim(),\n      };\n    })\n    .filter((utterance) => utterance.text);\n\n  const text =\n    String(payload.text || payload.transcript || '').trim() ||\n    utterances.map((utterance) => utterance.text).join(' ');\n\n  return {\n    text,\n    utterances,\n    language: payload.language || payload.detected_language || null,\n    duration: payload.duration ?? null,\n  };\n}\n\nfunction utterancesFromPlainTranscript(text, participants = []) {\n  const cleaned = String(text || '').trim();\n  if (!cleaned) {\n    return { text: '', utterances: [], language: null, duration: null };\n  }\n  const lines = cleaned.split(/\\n+/).map((line) => line.trim()).filter(Boolean);\n  const utterances = lines.map((line, index) => {\n    const tagged = line.match(/^([^:]{1,80}):\\s*(.+)$/);\n    if (tagged) {\n      return {\n        speaker_id: tagged[1].trim(),\n        start: null,\n        end: null,\n        text: tagged[2].trim(),\n      };\n    }\n    return {\n      speaker_id: participants[index % Math.max(participants.length, 1)]?.id || null,\n      start: null,\n      end: null,\n      text: line,\n    };\n  });\n  return { text: cleaned, utterances, language: null, duration: null };\n}\n\nconst meeting = $input.first().json;\nconst parsed = utterancesFromPlainTranscript(meeting.transcript, meeting.participants);\nreturn [{ json: { meeting, ...parsed } }];\n"
+      },
+      "id": "ac8e1668-c38d-44c5-adbc-c3c6f4fb781e",
+      "name": "Parse Inline Transcript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.transcript_url }}",
+        "options": {}
+      },
+      "id": "874aab22-3848-40de-a295-eaceee7a0405",
+      "name": "Fetch Transcript URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        840,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function parseSttResponse(stt, participants = []) {\n  const payload = stt || {};\n  const segments = payload.segments || payload.utterances || payload.chunks || [];\n  const fallbackSpeaker = (index) => {\n    if (!participants.length) return null;\n    return participants[index % participants.length]?.id || participants[index % participants.length]?.name || null;\n  };\n\n  const utterances = segments\n    .map((segment, index) => {\n      const speakerId =\n        segment.speaker_id ||\n        segment.speaker ||\n        segment.spk ||\n        (segment.speaker_label != null ? String(segment.speaker_label) : null) ||\n        fallbackSpeaker(index);\n      return {\n        speaker_id: speakerId == null ? null : String(speakerId),\n        start: segment.start ?? segment.start_time ?? segment.offset ?? null,\n        end: segment.end ?? segment.end_time ?? null,\n        text: String(segment.text || segment.transcript || segment.content || '').trim(),\n      };\n    })\n    .filter((utterance) => utterance.text);\n\n  const text =\n    String(payload.text || payload.transcript || '').trim() ||\n    utterances.map((utterance) => utterance.text).join(' ');\n\n  return {\n    text,\n    utterances,\n    language: payload.language || payload.detected_language || null,\n    duration: payload.duration ?? null,\n  };\n}\n\nfunction utterancesFromPlainTranscript(text, participants = []) {\n  const cleaned = String(text || '').trim();\n  if (!cleaned) {\n    return { text: '', utterances: [], language: null, duration: null };\n  }\n  const lines = cleaned.split(/\\n+/).map((line) => line.trim()).filter(Boolean);\n  const utterances = lines.map((line, index) => {\n    const tagged = line.match(/^([^:]{1,80}):\\s*(.+)$/);\n    if (tagged) {\n      return {\n        speaker_id: tagged[1].trim(),\n        start: null,\n        end: null,\n        text: tagged[2].trim(),\n      };\n    }\n    return {\n      speaker_id: participants[index % Math.max(participants.length, 1)]?.id || null,\n      start: null,\n      end: null,\n      text: line,\n    };\n  });\n  return { text: cleaned, utterances, language: null, duration: null };\n}\n\nconst meeting = $('Normalize Meeting Event').first().json;\nconst payload = $input.first().json;\nconst text = payload.text || payload.transcript || (typeof payload === 'string' ? payload : JSON.stringify(payload));\nconst parsed = utterancesFromPlainTranscript(text, meeting.participants);\nreturn [{ json: { meeting, ...parsed } }];\n"
+      },
+      "id": "4e3279c6-fee5-49ba-afaf-e816b7fc51b2",
+      "name": "Parse Remote Transcript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.recording_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "3307d68a-93a3-46a7-aeda-cc125ff26cbb",
+      "name": "Download Recording",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        840,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/audio/transcriptions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "parameterType": "formBinaryData",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "model",
+              "value": "whisper-1"
+            },
+            {
+              "name": "response_format",
+              "value": "verbose_json"
+            },
+            {
+              "name": "timestamp_granularities[]",
+              "value": "segment"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "53811f4e-6677-4f94-a7bb-2726e60a898a",
+      "name": "Speech-to-Text",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        620
+      ],
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "openai-bearer",
+          "name": "OpenAI Bearer"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function parseSttResponse(stt, participants = []) {\n  const payload = stt || {};\n  const segments = payload.segments || payload.utterances || payload.chunks || [];\n  const fallbackSpeaker = (index) => {\n    if (!participants.length) return null;\n    return participants[index % participants.length]?.id || participants[index % participants.length]?.name || null;\n  };\n\n  const utterances = segments\n    .map((segment, index) => {\n      const speakerId =\n        segment.speaker_id ||\n        segment.speaker ||\n        segment.spk ||\n        (segment.speaker_label != null ? String(segment.speaker_label) : null) ||\n        fallbackSpeaker(index);\n      return {\n        speaker_id: speakerId == null ? null : String(speakerId),\n        start: segment.start ?? segment.start_time ?? segment.offset ?? null,\n        end: segment.end ?? segment.end_time ?? null,\n        text: String(segment.text || segment.transcript || segment.content || '').trim(),\n      };\n    })\n    .filter((utterance) => utterance.text);\n\n  const text =\n    String(payload.text || payload.transcript || '').trim() ||\n    utterances.map((utterance) => utterance.text).join(' ');\n\n  return {\n    text,\n    utterances,\n    language: payload.language || payload.detected_language || null,\n    duration: payload.duration ?? null,\n  };\n}\n\nfunction utterancesFromPlainTranscript(text, participants = []) {\n  const cleaned = String(text || '').trim();\n  if (!cleaned) {\n    return { text: '', utterances: [], language: null, duration: null };\n  }\n  const lines = cleaned.split(/\\n+/).map((line) => line.trim()).filter(Boolean);\n  const utterances = lines.map((line, index) => {\n    const tagged = line.match(/^([^:]{1,80}):\\s*(.+)$/);\n    if (tagged) {\n      return {\n        speaker_id: tagged[1].trim(),\n        start: null,\n        end: null,\n        text: tagged[2].trim(),\n      };\n    }\n    return {\n      speaker_id: participants[index % Math.max(participants.length, 1)]?.id || null,\n      start: null,\n      end: null,\n      text: line,\n    };\n  });\n  return { text: cleaned, utterances, language: null, duration: null };\n}\n\nconst meeting = $('Normalize Meeting Event').first().json;\nconst parsed = parseSttResponse($input.first().json, meeting.participants);\nreturn [{ json: { meeting, ...parsed } }];\n"
+      },
+      "id": "698802fc-1dbc-4ff9-ab99-7d0a8ff09c9a",
+      "name": "Parse STT Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const FILLER_RE = /\\b(um+|uh+|erm+|ah+|you know|i mean|kind of|sort of)\\b/gi;\nconst SERVICE_RE = /\\[(inaudible|unintelligible|music|laughter|applause|silence|blank_audio)\\]/gi;\nconst RECORDING_NOTICE_RE = /this (meeting|call|conversation) is being recorded\\.?/gi;\n\nfunction cleanText(text) {\n  return String(text || '')\n    .replace(SERVICE_RE, ' ')\n    .replace(RECORDING_NOTICE_RE, ' ')\n    .replace(FILLER_RE, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction formatUtterance(utterance) {\n  const cleaned = cleanText(utterance.text);\n  if (!cleaned) return '';\n  const ts =\n    utterance.start != null\n      ? `[${utterance.start}${utterance.end != null ? `-${utterance.end}` : ''}] `\n      : '';\n  const speaker = utterance.speaker_id ? `${utterance.speaker_id}: ` : '';\n  return `${ts}${speaker}${cleaned}`.trim();\n}\n\nfunction chunkText(text, maxChars = 6000) {\n  const source = String(text || '').trim();\n  if (!source) return [];\n  if (source.length <= maxChars) {\n    return [{ chunk_index: 0, text: source, start_offset: 0, end_offset: source.length }];\n  }\n\n  const chunks = [];\n  let cursor = 0;\n  let index = 0;\n  while (cursor < source.length) {\n    let end = Math.min(cursor + maxChars, source.length);\n    if (end < source.length) {\n      const window = source.lastIndexOf('\\n', end);\n      const sentence = source.lastIndexOf('. ', end);\n      const splitAt = Math.max(window, sentence);\n      if (splitAt > cursor + Math.floor(maxChars * 0.4)) end = splitAt + 1;\n    }\n    const slice = source.slice(cursor, end).trim();\n    if (slice) {\n      chunks.push({\n        chunk_index: index,\n        text: slice,\n        start_offset: cursor,\n        end_offset: end,\n      });\n      index += 1;\n    }\n    cursor = end;\n  }\n  return chunks;\n}\n\nfunction preprocessTranscript(input, options = {}) {\n  const maxChars = options.maxChars || 6000;\n  const text = input?.text || '';\n  const utterances = Array.isArray(input?.utterances) ? input.utterances : [];\n  const lines = utterances.length\n    ? utterances.map(formatUtterance).filter(Boolean)\n    : [cleanText(text)];\n  const cleanedText = lines.join('\\n').trim();\n  const chunks = chunkText(cleanedText, maxChars).map((chunk, _, all) => ({\n    ...chunk,\n    chunk_total: all.length,\n  }));\n\n  return {\n    cleaned_text: cleanedText,\n    chunks,\n    utterance_count: utterances.length,\n    too_short: cleanedText.length < 40,\n  };\n}\n\nconst item = $input.first().json;\nconst processed = preprocessTranscript(item, { maxChars: 6000 });\nif (!processed.chunks.length) {\n  processed.chunks = [{\n    chunk_index: 0,\n    chunk_total: 1,\n    text: processed.cleaned_text || '(empty transcript)',\n    start_offset: 0,\n    end_offset: 0,\n  }];\n}\nreturn [{ json: { meeting: item.meeting, utterances: item.utterances || [], ...processed } }];\n"
+      },
+      "id": "1c1042c0-f4fb-4cae-acb4-f1a6eed45d5c",
+      "name": "Preprocess and Chunk",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a818886b-7ef3-46e3-a1f5-b9896ba29cfd",
+              "leftValue": "={{ $json.meeting.jira_epic_id }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "e3109a97-d055-42f4-a257-788aaefa7961",
+      "name": "IF Has Jira Epic",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1960,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8293a21f-a5ff-43d0-a275-e87c8a62c4f2",
+              "leftValue": "={{ $json.meeting.project_id }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "b4ccfb56-5511-45fc-a3b8-a186d0faabdf",
+      "name": "IF Has Project Id",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1960,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/issue/{{ $json.meeting.jira_epic_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {}
+      },
+      "id": "6dfcf3e6-1220-4035-a882-087fcd5e0aa0",
+      "name": "Fetch Jira Context",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2240,
+        180
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "atlassian-basic",
+          "name": "Atlassian API Token"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nreturn [{ json: { jira_skipped: true, issues: [] } }];\n"
+      },
+      "id": "5028ada6-b228-4afb-a04c-0e77d0530e79",
+      "name": "Empty Jira Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nreturn [{ json: { jiraItem: $input.first().json } }];\n"
+      },
+      "id": "d71c114b-b66e-439b-a03f-e7d97d52f7c9",
+      "name": "Wrap Jira Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CONFLUENCE_BASE_URL }}/wiki/rest/api/content/search?cql=text~{{ $json.meeting.project_id }}%20AND%20type=page&limit=5",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {}
+      },
+      "id": "d6d3adf1-62df-4b7b-a4f5-c8eb64c19b8c",
+      "name": "Fetch Confluence Context",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2240,
+        480
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "atlassian-basic",
+          "name": "Atlassian API Token"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nreturn [{ json: { confluence_skipped: true, results: [] } }];\n"
+      },
+      "id": "faf05988-6a80-45cc-adfe-15708811a930",
+      "name": "Empty Confluence Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nreturn [{ json: { confluenceItem: $input.first().json } }];\n"
+      },
+      "id": "746015a1-0efb-4c60-aa1a-a7b2e85afb29",
+      "name": "Wrap Confluence Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "numberInputs": 2
+      },
+      "id": "f34e0cfe-7443-412a-afd5-767023448d39",
+      "name": "Merge Context Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        2520,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function isHttpError(item) {\n  if (!item || typeof item !== 'object') return true;\n  if (item.error) return true;\n  const status = item.statusCode || item.status;\n  if (status && Number(status) >= 400) return true;\n  return false;\n}\n\nfunction assembleContext({ meeting, jiraItem, confluenceItem }) {\n  const warnings = [];\n  const jiraRequested = Boolean(meeting?.jira_epic_id);\n  const confluenceRequested = Boolean(meeting?.project_id);\n\n  let jira = { issues: [], epic: null, available: false };\n  if (jiraRequested && !jiraItem?.jira_skipped) {\n    if (isHttpError(jiraItem)) {\n      warnings.push('jira_unavailable');\n    } else {\n      jira = {\n        available: true,\n        epic: jiraItem.epic || jiraItem.key ? jiraItem : jiraItem.issues ? jiraItem.epic : jiraItem,\n        issues: jiraItem.issues || jiraItem.fields ? [jiraItem] : [],\n      };\n    }\n  }\n\n  let confluence = { pages: [], available: false };\n  if (confluenceRequested && !confluenceItem?.confluence_skipped) {\n    if (isHttpError(confluenceItem)) {\n      warnings.push('confluence_unavailable');\n    } else {\n      const results = confluenceItem.results || confluenceItem.pages || confluenceItem.contents || [];\n      confluence = { available: true, pages: results };\n    }\n  }\n\n  const incomplete = warnings.length > 0;\n  const contextText = [\n    incomplete ? 'CONTEXT STATUS: INCOMPLETE — generate the ADR anyway and mention missing systems.' : 'CONTEXT STATUS: complete',\n    jiraRequested ? `JIRA EPIC: ${meeting.jira_epic_id}` : 'JIRA: not requested',\n    jira.available ? `JIRA DATA: ${JSON.stringify(jira).slice(0, 4000)}` : warnings.includes('jira_unavailable') ? 'JIRA DATA: unavailable' : '',\n    confluenceRequested ? `CONFLUENCE PROJECT: ${meeting.project_id}` : 'CONFLUENCE: not requested',\n    confluence.available ? `CONFLUENCE DATA: ${JSON.stringify(confluence).slice(0, 4000)}` : warnings.includes('confluence_unavailable') ? 'CONFLUENCE DATA: unavailable' : '',\n    `OPTIONAL RAG STANDARDS: ${(meeting.architectural_standards || []).join(', ') || 'none (MVP, vector store not required)'}`,\n  ]\n    .filter(Boolean)\n    .join('\\n');\n\n  return {\n    jira,\n    confluence,\n    warnings,\n    incomplete,\n    context_text: contextText,\n    architectural_standards: meeting?.architectural_standards || [],\n  };\n}\n\nconst processed = $('Preprocess and Chunk').first().json;\nconst merged = $input.first().json;\nconst context = assembleContext({\n  meeting: processed.meeting,\n  jiraItem: merged.jiraItem || { jira_skipped: true },\n  confluenceItem: merged.confluenceItem || { confluence_skipped: true },\n});\nreturn [{ json: { ...processed, context } }];\n"
+      },
+      "id": "1954069f-ac4c-411a-a90f-38e51edf11a8",
+      "name": "Assemble Context Package",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2760,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst assembled = $input.first().json;\nreturn assembled.chunks.map((chunk) => ({\n  json: {\n    ...chunk,\n    meeting: assembled.meeting,\n    context: assembled.context,\n    extraction_text: [\n      'MEETING_ID: ' + assembled.meeting.meeting_id,\n      'TITLE: ' + (assembled.meeting.title || ''),\n      'PARTICIPANTS: ' + (assembled.meeting.participants || []).map((p) => p.name || p.id).join(', '),\n      assembled.context.context_text,\n      'CHUNK ' + (chunk.chunk_index + 1) + '/' + chunk.chunk_total + ':',\n      chunk.text,\n    ].join('\\n'),\n  },\n}));\n"
+      },
+      "id": "1ed1f22f-d41e-4195-ad53-9fff6333a13c",
+      "name": "Split Chunks For Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.extraction_text }}",
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{\n  \"requirements\": [\n    { \"id\": \"REQ-1\", \"text\": \"SSO for all tenants\", \"priority\": \"must\", \"source_quote\": \"We need SSO\", \"speaker_id\": \"Ada\" }\n  ]\n}",
+        "options": {
+          "systemPromptTemplate": "You are an architecture analyst extracting REQUIREMENTS only from a customer meeting transcript chunk.\nDo not extract decisions, alternatives, or constraints unless they are clearly requirements.\nA requirement is a capability, quality attribute, or business need that the system must/should satisfy.\nReturn JSON with a \"requirements\" array. Each item: id, text, priority (must|should|could), source_quote, speaker_id.\nIf none, return {\"requirements\": []}.\nNever invent requirements that were not discussed.",
+          "batching": {
+            "batchSize": 3,
+            "delayBetweenBatches": 250
+          }
+        }
+      },
+      "id": "22b9df37-30b4-41ff-a6bd-efc13340d8dc",
+      "name": "Requirements Extraction",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        3280,
+        80
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "29d03cfe-8cd6-4f6b-a6b3-62a2222165f2",
+      "name": "OpenAI Requirements",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        3280,
+        -80
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.extraction_text }}",
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{\n  \"constraints\": [\n    { \"id\": \"CON-1\", \"text\": \"Two engineers this quarter\", \"type\": \"time\", \"source_quote\": \"Budget is capped\" }\n  ]\n}",
+        "options": {
+          "systemPromptTemplate": "You are an architecture analyst extracting CONSTRAINTS only from a customer meeting transcript chunk.\nConstraints are hard limits: budget, timeline, tech stack mandates, compliance, team size, existing systems that cannot be replaced.\nDo not mix them with optional alternatives or accepted decisions.\nReturn JSON with a \"constraints\" array. Each item: id, text, type (technical|business|regulatory|time), source_quote.\nIf none, return {\"constraints\": []}.",
+          "batching": {
+            "batchSize": 3,
+            "delayBetweenBatches": 250
+          }
+        }
+      },
+      "id": "7159fb22-e7e7-4008-a8c0-dbe25e4a2277",
+      "name": "Constraints Extraction",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        3280,
+        280
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "77110316-6ba5-42df-afd0-cda05ee23101",
+      "name": "OpenAI Constraints",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        3520,
+        280
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.extraction_text }}",
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{\n  \"alternatives\": [\n    { \"id\": \"ALT-1\", \"title\": \"GraphQL\", \"description\": \"Single graph\", \"pros\": [\"flexible queries\"], \"cons\": [\"complexity\"], \"status\": \"discussed\", \"source_quote\": \"We compared REST and GraphQL\" }\n  ]\n}",
+        "options": {
+          "systemPromptTemplate": "You are an architecture analyst extracting ALTERNATIVES only from a customer meeting transcript chunk.\nCapture options that were discussed, compared, deferred, or rejected — not the final accepted decision.\nReturn JSON with an \"alternatives\" array. Each item: id, title, description, pros, cons, status (discussed|rejected|deferred), source_quote.\nIf none, return {\"alternatives\": []}.\nNever mark an alternative as accepted here; that belongs to Decisions Extraction.",
+          "batching": {
+            "batchSize": 3,
+            "delayBetweenBatches": 250
+          }
+        }
+      },
+      "id": "0a348507-dada-472a-a88e-ca07be12fa92",
+      "name": "Alternatives Extraction",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        3280,
+        520
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "83e79487-51ba-4831-a45a-395a319d2312",
+      "name": "OpenAI Alternatives",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        3520,
+        520
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.extraction_text }}",
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{\n  \"decisions\": [\n    { \"id\": \"DEC-1\", \"text\": \"Use REST for the public API\", \"explicit\": true, \"chosen_alternative_id\": null, \"rationale\": \"simpler\", \"source_quote\": \"We decided to go with REST\", \"confidence\": \"high\", \"status\": \"accepted\" }\n  ],\n  \"open_questions\": [{ \"id\": \"Q-1\", \"text\": \"How do we version the API?\", \"source_quote\": \"Open question\" }],\n  \"risks\": [{ \"id\": \"RISK-1\", \"text\": \"GraphQL fans will push back\", \"severity\": \"medium\", \"source_quote\": \"Risk is\" }]\n}",
+        "options": {
+          "systemPromptTemplate": "You are an architecture analyst extracting DECISIONS, OPEN QUESTIONS and RISKS from a customer meeting transcript chunk.\nA decision must be EXPLICITLY accepted in the transcript (phrases like \"we decided\", \"we'll go with\", \"agreed\", \"approved\", \"принимаем\").\nIf people only discussed options, set explicit=false or omit the decision.\nNever promote a guessed or implied choice to an accepted decision.\nReturn JSON:\n{\n  \"decisions\": [{\"id\":\"DEC-1\",\"text\":\"...\",\"explicit\":true,\"chosen_alternative_id\":null,\"rationale\":\"...\",\"source_quote\":\"...\",\"confidence\":\"high|medium|low\",\"status\":\"accepted|discussed\"}],\n  \"open_questions\": [{\"id\":\"Q-1\",\"text\":\"...\",\"source_quote\":\"...\"}],\n  \"risks\": [{\"id\":\"RISK-1\",\"text\":\"...\",\"severity\":\"high|medium|low\",\"source_quote\":\"...\"}]\n}",
+          "batching": {
+            "batchSize": 3,
+            "delayBetweenBatches": 250
+          }
+        }
+      },
+      "id": "60dfa6c0-d695-42a9-afd2-711e08d38ab7",
+      "name": "Decisions Extraction",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        3280,
+        760
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "b84f17f0-95da-40b1-a25a-ed9b6afd7d3e",
+      "name": "OpenAI Decisions",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        3520,
+        760
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst srcItems = $('Split Chunks For Extraction').all();\nreturn $input.all().map((item, index) => {\n  const src = srcItems[index] ? srcItems[index].json : {};\n  const output = item.json.output || item.json;\n  return { json: { extractor: 'requirements', chunk_index: src.chunk_index ?? index, requirements: output.requirements || [], constraints: [], alternatives: [], decisions: [], open_questions: [], risks: [] } };\n});\n"
+      },
+      "id": "0f3b8ab7-10fe-420a-afa7-688103f71acb",
+      "name": "Tag Requirements",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3760,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst srcItems = $('Split Chunks For Extraction').all();\nreturn $input.all().map((item, index) => {\n  const src = srcItems[index] ? srcItems[index].json : {};\n  const output = item.json.output || item.json;\n  return { json: { extractor: 'constraints', chunk_index: src.chunk_index ?? index, requirements: [], constraints: output.constraints || [], alternatives: [], decisions: [], open_questions: [], risks: [] } };\n});\n"
+      },
+      "id": "de454265-e667-4467-af1f-94009059e725",
+      "name": "Tag Constraints",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3760,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst srcItems = $('Split Chunks For Extraction').all();\nreturn $input.all().map((item, index) => {\n  const src = srcItems[index] ? srcItems[index].json : {};\n  const output = item.json.output || item.json;\n  return { json: { extractor: 'alternatives', chunk_index: src.chunk_index ?? index, requirements: [], constraints: [], alternatives: output.alternatives || [], decisions: [], open_questions: [], risks: [] } };\n});\n"
+      },
+      "id": "626745f3-1871-45fb-a4e5-2a31dc7020c2",
+      "name": "Tag Alternatives",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3760,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst srcItems = $('Split Chunks For Extraction').all();\nreturn $input.all().map((item, index) => {\n  const src = srcItems[index] ? srcItems[index].json : {};\n  const output = item.json.output || item.json;\n  return { json: { extractor: 'decisions', chunk_index: src.chunk_index ?? index, requirements: [], constraints: [], alternatives: [], decisions: output.decisions || [], open_questions: output.open_questions || [], risks: output.risks || [] } };\n});\n"
+      },
+      "id": "e781654d-8ff3-4edd-a2c1-c31e65c9262e",
+      "name": "Tag Decisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3760,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 4
+      },
+      "id": "c4aeedde-61a0-4874-a289-4bdbccd9a7dc",
+      "name": "Merge Extraction Streams",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        4000,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function normalizeKey(value) {\n  return String(value || '')\n    .toLowerCase()\n    .replace(/[^a-z0-9а-яё\\s]/gi, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction itemText(item) {\n  if (!item || typeof item === 'string') return String(item || '');\n  return item.text || item.title || item.description || item.decision || '';\n}\n\nfunction itemId(item, prefix, index) {\n  return item?.id || `${prefix}-${index + 1}`;\n}\n\nfunction similar(a, b) {\n  const left = normalizeKey(a);\n  const right = normalizeKey(b);\n  if (!left || !right) return false;\n  if (left === right) return true;\n  if (left.length > 24 && right.includes(left)) return true;\n  if (right.length > 24 && left.includes(right)) return true;\n  const leftTokens = new Set(left.split(' ').filter((token) => token.length > 3));\n  const rightTokens = new Set(right.split(' ').filter((token) => token.length > 3));\n  if (!leftTokens.size || !rightTokens.size) return false;\n  let overlap = 0;\n  for (const token of leftTokens) {\n    if (rightTokens.has(token)) overlap += 1;\n  }\n  const ratio = overlap / Math.min(leftTokens.size, rightTokens.size);\n  return ratio >= 0.72 && overlap >= 3;\n}\n\nfunction dedupe(items, prefix) {\n  const result = [];\n  for (const item of items || []) {\n    const text = itemText(item);\n    if (!text.trim()) continue;\n    const existing = result.find((candidate) => similar(itemText(candidate), text));\n    if (!existing) {\n      result.push({\n        ...(typeof item === 'object' ? item : { text: item }),\n        id: itemId(item, prefix, result.length),\n        text: text.trim(),\n        sources: [item?.chunk_index].filter((value) => value != null),\n      });\n      continue;\n    }\n    existing.sources = Array.from(new Set([...(existing.sources || []), item?.chunk_index].filter((value) => value != null)));\n    if ((item.priority === 'must' || item.explicit === true) && existing.priority !== 'must') {\n      Object.assign(existing, item, { id: existing.id, text: existing.text, sources: existing.sources });\n    }\n  }\n  return result;\n}\n\nfunction negationConflict(a, b) {\n  const left = normalizeKey(a);\n  const right = normalizeKey(b);\n  const pair = [left, right];\n  const hasNeg = (text) => /\\b(not|no|don't|do not|reject|avoid|against|не|нет)\\b/.test(text);\n  if (hasNeg(left) !== hasNeg(right) && similar(left.replace(/\\b(not|no|don't|do not|reject|avoid|against|не|нет)\\b/g, ''), right.replace(/\\b(not|no|don't|do not|reject|avoid|against|не|нет)\\b/g, ''))) {\n    return true;\n  }\n  const tech = ['graphql', 'rest', 'grpc', 'kafka', 'rabbitmq', 'postgres', 'mongodb', 'mysql', 'kubernetes', 'ecs', 'lambda'];\n  const chosen = (text) => tech.filter((token) => text.includes(token));\n  const leftTech = chosen(left);\n  const rightTech = chosen(right);\n  if (leftTech.length && rightTech.length && leftTech.some((token) => !rightTech.includes(token)) && rightTech.some((token) => !leftTech.includes(token))) {\n    if (/\\b(use|adopt|choose|go with|выбра|принима)\\b/.test(left) && /\\b(use|adopt|choose|go with|выбра|принима)\\b/.test(right)) {\n      return true;\n    }\n  }\n  return pair.length === 2 && false;\n}\n\nfunction detectContradictions(decisions) {\n  const contradictions = [];\n  for (let i = 0; i < decisions.length; i += 1) {\n    for (let j = i + 1; j < decisions.length; j += 1) {\n      const left = decisions[i];\n      const right = decisions[j];\n      if (left.chosen_alternative_id && right.chosen_alternative_id && left.chosen_alternative_id !== right.chosen_alternative_id) {\n        contradictions.push({\n          type: 'alternative_mismatch',\n          left_id: left.id,\n          right_id: right.id,\n          message: `Decisions ${left.id} and ${right.id} choose different alternatives`,\n        });\n        continue;\n      }\n      if (negationConflict(itemText(left), itemText(right))) {\n        contradictions.push({\n          type: 'opposing_statements',\n          left_id: left.id,\n          right_id: right.id,\n          message: `Decisions ${left.id} and ${right.id} appear to contradict each other`,\n        });\n      }\n    }\n  }\n  return contradictions;\n}\n\nfunction matchAlternativesToDecisions(alternatives, decisions) {\n  return decisions.map((decision) => {\n    const byId = alternatives.find((alt) => alt.id && alt.id === decision.chosen_alternative_id);\n    if (byId) {\n      return { ...decision, matched_alternative: byId.id };\n    }\n    const byText = alternatives.find((alt) => similar(itemText(alt), itemText(decision)) || similar(alt.title, itemText(decision)));\n    return { ...decision, matched_alternative: byText?.id || decision.chosen_alternative_id || null };\n  });\n}\n\nfunction collectFromChunks(chunkResults) {\n  const buckets = {\n    requirements: [],\n    constraints: [],\n    alternatives: [],\n    decisions: [],\n    open_questions: [],\n    risks: [],\n  };\n  for (const chunk of chunkResults || []) {\n    const data = chunk.data || chunk.output || chunk;\n    const chunkIndex = chunk.chunk_index ?? data.chunk_index;\n    for (const key of Object.keys(buckets)) {\n      for (const item of data[key] || []) {\n        buckets[key].push({\n          ...(typeof item === 'object' ? item : { text: item }),\n          chunk_index: chunkIndex,\n        });\n      }\n    }\n  }\n  return buckets;\n}\n\nfunction aggregateExtractions(chunkResults) {\n  const collected = collectFromChunks(chunkResults);\n  const requirements = dedupe(collected.requirements, 'REQ');\n  const constraints = dedupe(collected.constraints, 'CON');\n  const alternatives = dedupe(collected.alternatives, 'ALT');\n  const openQuestions = dedupe(collected.open_questions, 'Q');\n  const risks = dedupe(collected.risks, 'RISK');\n  const decisions = matchAlternativesToDecisions(alternatives, dedupe(collected.decisions, 'DEC'));\n  const contradictions = detectContradictions(decisions);\n\n  return {\n    requirements,\n    constraints,\n    alternatives,\n    decisions,\n    open_questions: openQuestions,\n    risks,\n    contradictions,\n    chunk_count: (chunkResults || []).length,\n  };\n}\n\nconst items = $input.all().map((item) => item.json);\nconst byChunk = new Map();\nfor (const item of items) {\n  const idx = item.chunk_index ?? 0;\n  if (!byChunk.has(idx)) {\n    byChunk.set(idx, { chunk_index: idx, requirements: [], constraints: [], alternatives: [], decisions: [], open_questions: [], risks: [] });\n  }\n  const bucket = byChunk.get(idx);\n  for (const key of ['requirements', 'constraints', 'alternatives', 'decisions', 'open_questions', 'risks']) {\n    if (Array.isArray(item[key])) bucket[key].push(...item[key]);\n  }\n}\nconst aggregated = aggregateExtractions([...byChunk.values()]);\nconst assembled = $('Assemble Context Package').first().json;\nreturn [{ json: {\n  meeting: assembled.meeting,\n  context: assembled.context,\n  aggregated,\n  extraction: {\n    requirements: aggregated.requirements,\n    constraints: aggregated.constraints,\n    alternatives: aggregated.alternatives,\n    decisions: aggregated.decisions,\n    open_questions: aggregated.open_questions,\n    risks: aggregated.risks,\n  },\n} }];\n"
+      },
+      "id": "404616a6-d835-4ac8-a3c6-6264df91e316",
+      "name": "Aggregate Reduce",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ 'Meeting ' + $json.meeting.meeting_id + '\\nSource: ' + $json.meeting.source + '\\n\\nCONTEXT PACKAGE:\\n' + $json.context.context_text + '\\n\\nAGGREGATED EXTRACTION JSON:\\n' + JSON.stringify($json.extraction, null, 2) + '\\n\\nWrite the ADR JSON now. If extraction.decisions has no explicit accepted item, status MUST be Needs clarification and you MUST NOT invent a decision.' }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are a software architect writing an Architecture Decision Record.\nUse ONLY the provided aggregated extraction and meeting context. Do not invent a decision that was not explicitly accepted.\nIf there is no explicit accepted decision, set status to \"Needs clarification\" and write decision as a clarification request, not as a fabricated choice.\nIf context is marked incomplete, mention that Jira/Confluence data was missing.\nReturn a single JSON object with exactly this shape:\n{\n  \"title\": \"ADR: <краткое описание решения>\",\n  \"status\": \"Proposed\",\n  \"context\": \"...\",\n  \"decision\": \"...\",\n  \"alternatives\": [],\n  \"consequences\": {\n    \"positive\": [],\n    \"negative\": []\n  },\n  \"open_questions\": [],\n  \"risks\": [],\n  \"source_meeting\": \"meeting-123\"\n}\nstatus must be \"Proposed\" or \"Needs clarification\"."
+            }
+          ]
+        }
+      },
+      "id": "bcd22669-5c4a-4d75-a93d-4532797e51e8",
+      "name": "Generate ADR",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        4480,
+        400
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "6d7b0e98-72a4-4071-a846-6679140d1649",
+      "name": "OpenAI Generate ADR",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        4480,
+        240
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{\n  \"title\": \"ADR: Use REST for the public API\",\n  \"status\": \"Proposed\",\n  \"context\": \"The meeting compared REST and GraphQL under a two-engineer constraint.\",\n  \"decision\": \"Use REST for the public API.\",\n  \"alternatives\": [\"GraphQL\"],\n  \"consequences\": { \"positive\": [\"Simpler ops\"], \"negative\": [\"More endpoints\"] },\n  \"open_questions\": [\"How do we version the API?\"],\n  \"risks\": [\"GraphQL advocates may push back\"],\n  \"source_meeting\": \"meeting-123\"\n}",
+        "autoFix": true
+      },
+      "id": "06dabab3-c487-41e3-a60b-a1ebb2e21165",
+      "name": "Structured Output Parser ADR",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        4480,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "5f93df5e-d79d-40fa-aa2b-abecd0ca588c",
+      "name": "OpenAI Autofix Parser",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        4680,
+        560
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function unwrapOutput(value) {\n  if (value && typeof value === 'object' && !Array.isArray(value) && value.output && typeof value.output === 'object') {\n    return value.output;\n  }\n  return value;\n}\n\nfunction parseAiJson(raw) {\n  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {\n    return { ok: true, data: unwrapOutput(raw), error: null };\n  }\n\n  const text = String(raw ?? '').trim();\n  if (!text) {\n    return { ok: false, data: null, error: 'empty_response' };\n  }\n\n  const fence = text.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  const candidate = (fence ? fence[1] : text).trim();\n  const start = candidate.indexOf('{');\n  const end = candidate.lastIndexOf('}');\n  if (start === -1 || end <= start) {\n    return { ok: false, data: null, error: 'no_json_object' };\n  }\n\n  try {\n    const parsed = JSON.parse(candidate.slice(start, end + 1));\n    return { ok: true, data: unwrapOutput(parsed), error: null };\n  } catch (error) {\n    return { ok: false, data: null, error: error.message };\n  }\n}\n\nfunction emptyExtraction() {\n  return {\n    requirements: [],\n    constraints: [],\n    alternatives: [],\n    decisions: [],\n    open_questions: [],\n    risks: [],\n  };\n}\n\nfunction ensureExtractionShape(data) {\n  const base = emptyExtraction();\n  const src = data && typeof data === 'object' ? data : {};\n  for (const key of Object.keys(base)) {\n    base[key] = Array.isArray(src[key]) ? src[key] : [];\n  }\n  return base;\n}\n\nconst previous = $('Aggregate Reduce').first().json;\nconst parsed = parseAiJson($input.first().json);\nreturn [{ json: { ...previous, json_ok: parsed.ok, json_error: parsed.error, adr_raw: parsed.data, retry_count: 0 } }];\n"
+      },
+      "id": "11e07d5e-9882-4659-aaf2-68eb5afd720d",
+      "name": "Parse Generated ADR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4920,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c6fa39b8-2c3e-47e3-a229-23289450ab41",
+              "leftValue": "={{ $json.json_ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "81504955-1aae-44ee-a82d-d1562d8e862f",
+      "name": "IF ADR JSON Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5160,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ 'Previous error: ' + $json.json_error + '\\n\\nMeeting ' + $json.meeting.meeting_id + '\\n\\nCONTEXT:\\n' + $json.context.context_text + '\\n\\nEXTRACTION:\\n' + JSON.stringify($json.extraction, null, 2) + '\\n\\nReturn ONLY valid ADR JSON. No markdown.' }}",
+        "hasOutputParser": false,
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are a software architect writing an Architecture Decision Record.\nUse ONLY the provided aggregated extraction and meeting context. Do not invent a decision that was not explicitly accepted.\nIf there is no explicit accepted decision, set status to \"Needs clarification\" and write decision as a clarification request, not as a fabricated choice.\nIf context is marked incomplete, mention that Jira/Confluence data was missing.\nReturn a single JSON object with exactly this shape:\n{\n  \"title\": \"ADR: <краткое описание решения>\",\n  \"status\": \"Proposed\",\n  \"context\": \"...\",\n  \"decision\": \"...\",\n  \"alternatives\": [],\n  \"consequences\": {\n    \"positive\": [],\n    \"negative\": []\n  },\n  \"open_questions\": [],\n  \"risks\": [],\n  \"source_meeting\": \"meeting-123\"\n}\nstatus must be \"Proposed\" or \"Needs clarification\".\n\nYour previous output was not valid JSON. Return ONLY the JSON object, no markdown fences, no commentary."
+            }
+          ]
+        }
+      },
+      "id": "ceb3a856-3e1f-4f08-a5c5-34fc642a05eb",
+      "name": "Retry Generate ADR",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        5400,
+        620
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "6c38d3b9-52ad-40d1-a651-800a62f1859d",
+      "name": "OpenAI Retry ADR",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        5400,
+        780
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-api",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function unwrapOutput(value) {\n  if (value && typeof value === 'object' && !Array.isArray(value) && value.output && typeof value.output === 'object') {\n    return value.output;\n  }\n  return value;\n}\n\nfunction parseAiJson(raw) {\n  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {\n    return { ok: true, data: unwrapOutput(raw), error: null };\n  }\n\n  const text = String(raw ?? '').trim();\n  if (!text) {\n    return { ok: false, data: null, error: 'empty_response' };\n  }\n\n  const fence = text.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  const candidate = (fence ? fence[1] : text).trim();\n  const start = candidate.indexOf('{');\n  const end = candidate.lastIndexOf('}');\n  if (start === -1 || end <= start) {\n    return { ok: false, data: null, error: 'no_json_object' };\n  }\n\n  try {\n    const parsed = JSON.parse(candidate.slice(start, end + 1));\n    return { ok: true, data: unwrapOutput(parsed), error: null };\n  } catch (error) {\n    return { ok: false, data: null, error: error.message };\n  }\n}\n\nfunction emptyExtraction() {\n  return {\n    requirements: [],\n    constraints: [],\n    alternatives: [],\n    decisions: [],\n    open_questions: [],\n    risks: [],\n  };\n}\n\nfunction ensureExtractionShape(data) {\n  const base = emptyExtraction();\n  const src = data && typeof data === 'object' ? data : {};\n  for (const key of Object.keys(base)) {\n    base[key] = Array.isArray(src[key]) ? src[key] : [];\n  }\n  return base;\n}\n\nconst previous = $('Parse Generated ADR').first().json;\nconst parsed = parseAiJson($input.first().json);\nreturn [{ json: { ...previous, json_ok: parsed.ok, json_error: parsed.error, adr_raw: parsed.data, retry_count: 1 } }];\n"
+      },
+      "id": "13fdb134-8e03-499f-a0e1-235580cee139",
+      "name": "Parse Retry ADR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5640,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a7f66fb4-7ca9-4d7a-a7fa-f64e78be2cca",
+              "leftValue": "={{ $json.json_ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "10d3421c-8b8e-4f27-a486-589c4ab57734",
+      "name": "IF Retry JSON Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5880,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':x: ADR pipeline stopped: invalid JSON from AI after retry. Meeting ' + $('Normalize Meeting Event').first().json.meeting_id + ' — ' + $json.json_error }) }}",
+        "options": {}
+      },
+      "id": "46bd02d8-bcda-4d63-a53c-1321821a6c65",
+      "name": "Notify Invalid JSON",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6120,
+        820
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst item = $input.first().json;\nconst meeting = $('Normalize Meeting Event').first().json;\nconsole.log(JSON.stringify({ level: 'error', event: 'adr_invalid_json', meeting_id: meeting.meeting_id, error: item.json_error, retry_count: item.retry_count }));\nreturn [{ json: { stopped: true, reason: 'invalid_json', meeting_id: meeting.meeting_id, error: item.json_error } }];\n"
+      },
+      "id": "0c685ba4-d8ff-47b6-a561-877c91944a5b",
+      "name": "Log Invalid JSON Stop",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6360,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const REQUIRED_ADR_KEYS = [\n  'title',\n  'status',\n  'context',\n  'decision',\n  'alternatives',\n  'consequences',\n  'open_questions',\n  'risks',\n  'source_meeting',\n];\n\nfunction hasExplicitDecision(aggregated) {\n  const decisions = aggregated?.decisions || [];\n  return decisions.some((decision) => {\n    const text = String(decision?.text || decision?.decision || '').trim();\n    if (!text) return false;\n    if (decision.explicit === false) return false;\n    const status = String(decision.status || '').toLowerCase();\n    if (['discussed', 'proposed', 'deferred', 'rejected'].includes(status)) return false;\n    if (decision.explicit === true) return true;\n    if (['accepted', 'decided', 'approved', 'chosen'].includes(status)) return true;\n    return false;\n  });\n}\n\nfunction missingSections(adr) {\n  const missing = [];\n  for (const key of REQUIRED_ADR_KEYS) {\n    if (adr[key] == null || adr[key] === '') missing.push(key);\n  }\n  if (!adr?.consequences || typeof adr.consequences !== 'object') {\n    if (!missing.includes('consequences')) missing.push('consequences');\n  }\n  return missing;\n}\n\nfunction validateAdr({ adr, aggregated = {}, jsonError = null, contextIncomplete = false }) {\n  if (jsonError) {\n    return {\n      ok: false,\n      block_publication: true,\n      needs_clarification: false,\n      has_contradictions: false,\n      status: 'invalid_json',\n      issues: [{ code: 'invalid_json', message: String(jsonError) }],\n      adr: null,\n    };\n  }\n\n  const result = {\n    title: adr?.title || 'ADR: Untitled',\n    status: adr?.status || 'Proposed',\n    context: adr?.context || '',\n    decision: adr?.decision || '',\n    alternatives: Array.isArray(adr?.alternatives) ? adr.alternatives : [],\n    consequences: {\n      positive: Array.isArray(adr?.consequences?.positive) ? adr.consequences.positive : [],\n      negative: Array.isArray(adr?.consequences?.negative) ? adr.consequences.negative : [],\n    },\n    open_questions: Array.isArray(adr?.open_questions) ? adr.open_questions : aggregated.open_questions || [],\n    risks: Array.isArray(adr?.risks) ? adr.risks : aggregated.risks || [],\n    source_meeting: adr?.source_meeting || aggregated.source_meeting || '',\n  };\n\n  const issues = [];\n  const explicit = hasExplicitDecision(aggregated);\n  const contradictions = aggregated.contradictions || [];\n\n  if (!explicit) {\n    result.status = 'Needs clarification';\n    if (!String(result.decision).trim()) {\n      result.decision =\n        'No explicit architecture decision was recorded in the source meeting. Clarification is required before this ADR can be accepted.';\n    }\n    issues.push({\n      code: 'no_explicit_decision',\n      message: 'Transcript did not contain an explicitly accepted decision. Status forced to Needs clarification.',\n    });\n  }\n\n  if (!String(result.context).trim()) {\n    issues.push({ code: 'missing_context', message: 'ADR context is empty.' });\n    result.status = 'Needs clarification';\n  }\n\n  if (!String(result.decision).trim()) {\n    issues.push({ code: 'missing_decision', message: 'ADR decision field is empty.' });\n    result.status = 'Needs clarification';\n  }\n\n  if (contradictions.length) {\n    issues.push({\n      code: 'contradictory_decisions',\n      message: 'Aggregated extraction contains contradictory decisions.',\n      items: contradictions,\n    });\n    if (result.status === 'Proposed') result.status = 'Needs clarification';\n  }\n\n  if (contextIncomplete) {\n    issues.push({\n      code: 'incomplete_context',\n      message: 'Jira/Confluence context was unavailable or partial. ADR generated with degraded context.',\n    });\n    if (!/incomplete context/i.test(result.context)) {\n      result.context = `[INCOMPLETE CONTEXT] ${result.context}`.trim();\n    }\n  }\n\n  const missing = missingSections(result);\n  if (missing.length) {\n    issues.push({ code: 'missing_sections', message: `Missing ADR sections: ${missing.join(', ')}`, items: missing });\n  }\n\n  return {\n    ok: !issues.some((issue) => issue.code === 'invalid_json'),\n    block_publication: false,\n    needs_clarification: result.status === 'Needs clarification',\n    has_contradictions: contradictions.length > 0,\n    issues,\n    adr: result,\n  };\n}\n\nconst item = $input.first().json;\nconst result = validateAdr({\n  adr: item.adr_raw,\n  aggregated: { ...item.aggregated, source_meeting: item.meeting.meeting_id },\n  jsonError: item.json_ok ? null : item.json_error,\n  contextIncomplete: Boolean(item.context && item.context.incomplete),\n});\nif (result.adr) result.adr.source_meeting = item.meeting.meeting_id;\nreturn [{ json: { ...item, validation: result, adr: result.adr } }];\n"
+      },
+      "id": "05986cd1-8a95-4c33-a107-5200ff8702c9",
+      "name": "Validate ADR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5400,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function asList(items) {\n  return (items || []).map((item) => {\n    if (typeof item === 'string') return item;\n    return item.text || item.title || JSON.stringify(item);\n  });\n}\n\nfunction htmlList(items) {\n  const values = asList(items);\n  if (!values.length) return '<p><em>None</em></p>';\n  return `<ul>${values.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`;\n}\n\nfunction escapeHtml(value) {\n  return String(value || '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n}\n\nfunction formatConfluenceStorage(adr, extras = {}) {\n  const warnings = extras.warnings || [];\n  const warningHtml = warnings.length\n    ? `<ac:structured-macro ac:name=\"warning\"><ac:rich-text-body><p>${escapeHtml(warnings.join(' '))}</p></ac:rich-text-body></ac:structured-macro>`\n    : '';\n  return `${warningHtml}\n<h1>${escapeHtml(adr.title)}</h1>\n<p><strong>Status:</strong> ${escapeHtml(adr.status)}</p>\n<h2>Context</h2>\n<p>${escapeHtml(adr.context)}</p>\n<h2>Decision</h2>\n<p>${escapeHtml(adr.decision)}</p>\n<h2>Alternatives</h2>\n${htmlList(adr.alternatives)}\n<h2>Consequences</h2>\n<h3>Positive</h3>\n${htmlList(adr.consequences?.positive)}\n<h3>Negative</h3>\n${htmlList(adr.consequences?.negative)}\n<h2>Open Questions</h2>\n${htmlList(adr.open_questions)}\n<h2>Risks</h2>\n${htmlList(adr.risks)}\n<h2>Source Meeting</h2>\n<p>${escapeHtml(adr.source_meeting)}</p>`;\n}\n\nfunction formatNotionChildren(adr) {\n  const heading = (text) => ({\n    object: 'block',\n    type: 'heading_2',\n    heading_2: { rich_text: [{ type: 'text', text: { content: text } }] },\n  });\n  const paragraph = (text) => ({\n    object: 'block',\n    type: 'paragraph',\n    paragraph: { rich_text: [{ type: 'text', text: { content: String(text || '').slice(0, 1900) } }] },\n  });\n  const bullets = (items) =>\n    asList(items).map((item) => ({\n      object: 'block',\n      type: 'bulleted_list_item',\n      bulleted_list_item: { rich_text: [{ type: 'text', text: { content: String(item).slice(0, 1900) } }] },\n    }));\n\n  return [\n    paragraph(`Status: ${adr.status}`),\n    heading('Context'),\n    paragraph(adr.context),\n    heading('Decision'),\n    paragraph(adr.decision),\n    heading('Alternatives'),\n    ...(bullets(adr.alternatives).length ? bullets(adr.alternatives) : [paragraph('None')]),\n    heading('Consequences'),\n    paragraph('Positive'),\n    ...bullets(adr.consequences?.positive),\n    paragraph('Negative'),\n    ...bullets(adr.consequences?.negative),\n    heading('Open Questions'),\n    ...(bullets(adr.open_questions).length ? bullets(adr.open_questions) : [paragraph('None')]),\n    heading('Risks'),\n    ...(bullets(adr.risks).length ? bullets(adr.risks) : [paragraph('None')]),\n    heading('Source Meeting'),\n    paragraph(adr.source_meeting),\n  ];\n}\n\nfunction formatSlackMrkdwn(adr, extras = {}) {\n  const reviewUrl = extras.reviewUrl ? `\\nReview form: ${extras.reviewUrl}` : '';\n  const warnings = extras.warnings?.length ? `\\n:warning: ${extras.warnings.join(' | ')}` : '';\n  return `*${adr.title}*\\nStatus: \\`${adr.status}\\`${warnings}\\n\\n*Context*\\n${adr.context}\\n\\n*Decision*\\n${adr.decision}\\n\\n*Source*: ${adr.source_meeting}${reviewUrl}`;\n}\n\nfunction formatJiraAdf(adr, extras = {}) {\n  const textBlock = (text) => ({\n    type: 'paragraph',\n    content: [{ type: 'text', text: String(text || '—') }],\n  });\n  const heading = (text) => ({\n    type: 'heading',\n    attrs: { level: 2 },\n    content: [{ type: 'text', text }],\n  });\n  const bullets = (items) => ({\n    type: 'bulletList',\n    content: asList(items).map((item) => ({\n      type: 'listItem',\n      content: [textBlock(item)],\n    })),\n  });\n  const warnings = extras.warnings?.length ? [textBlock(`Warnings: ${extras.warnings.join(' | ')}`)] : [];\n  return {\n    type: 'doc',\n    version: 1,\n    content: [\n      ...warnings,\n      textBlock(`${adr.title} [${adr.status}]`),\n      heading('Context'),\n      textBlock(adr.context),\n      heading('Decision'),\n      textBlock(adr.decision),\n      heading('Alternatives'),\n      asList(adr.alternatives).length ? bullets(adr.alternatives) : textBlock('None'),\n      heading('Consequences — Positive'),\n      asList(adr.consequences?.positive).length ? bullets(adr.consequences.positive) : textBlock('None'),\n      heading('Consequences — Negative'),\n      asList(adr.consequences?.negative).length ? bullets(adr.consequences.negative) : textBlock('None'),\n      heading('Open Questions'),\n      asList(adr.open_questions).length ? bullets(adr.open_questions) : textBlock('None'),\n      heading('Risks'),\n      asList(adr.risks).length ? bullets(adr.risks) : textBlock('None'),\n      heading('Source Meeting'),\n      textBlock(adr.source_meeting),\n    ],\n  };\n}\n\nfunction buildPublishPayloads(adr, extras = {}) {\n  return {\n    confluence_storage: formatConfluenceStorage(adr, extras),\n    notion_children: formatNotionChildren(adr),\n    slack_mrkdwn: formatSlackMrkdwn(adr, extras),\n    jira_adf: formatJiraAdf(adr, extras),\n    title: adr.title,\n    status: adr.status,\n  };\n}\n\nconst item = $input.first().json;\nconst extras = {\n  warnings: (item.validation.issues || []).map((issue) => issue.message),\n  reviewUrl: $execution.resumeFormUrl,\n};\nconst documents = buildPublishPayloads(item.adr, extras);\nreturn [{ json: {\n  meeting: item.meeting,\n  aggregated: item.aggregated,\n  extraction: item.extraction,\n  validation: item.validation,\n  adr: item.adr,\n  documents,\n  review_url: extras.reviewUrl,\n} }];\n"
+      },
+      "id": "732d33c2-2ffa-4283-a39b-c1d40e5caf6f",
+      "name": "Prepare Review Package",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5640,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.documents.slack_mrkdwn + '\\n\\nHuman review is required before publication.\\nOpen the review form: ' + $json.review_url }) }}",
+        "options": {}
+      },
+      "id": "b30e2f05-fab2-462c-ad49-74136524dd75",
+      "name": "Notify Architect Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5880,
+        180
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TEAMS_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.adr.title + ' [' + $json.adr.status + '] — review before publish: ' + $json.review_url }) }}",
+        "options": {}
+      },
+      "id": "a786d577-206c-4bbd-a1cb-a10ebc12054d",
+      "name": "Notify Architect Teams",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5880,
+        360
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "numberInputs": 2
+      },
+      "id": "35cc968e-9735-440c-a509-71462db8a35b",
+      "name": "Merge Review Notifications",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        6120,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "form",
+        "formTitle": "ADR Human Review",
+        "formDescription": "Approve, reject, or request changes. Publication runs only after Approve. Status Needs clarification still allows approve-to-publish with the clarification mark.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "action",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Approve"
+                  },
+                  {
+                    "option": "Reject"
+                  },
+                  {
+                    "option": "Request changes"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "comments",
+              "fieldType": "textarea",
+              "requiredField": false
+            }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "0981c4fe-8724-4c23-a5c1-5bc7ed86b368",
+      "name": "Human Review",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        6360,
+        280
+      ],
+      "webhookId": "321ddaf6-cd3f-4da6-a0b0-b0242e33d6ad"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst review = $input.first().json;\nconst prepared = $('Prepare Review Package').first().json;\nconst action = review.action || review['Review decision'] || review.data?.action || '';\nreturn [{ json: {\n  ...prepared,\n  review_action: String(action).trim(),\n  review_comments: review.comments || review.Comments || review.data?.comments || '',\n} }];\n"
+      },
+      "id": "9d5497e7-9940-4152-a684-27315c748c7f",
+      "name": "Parse Review Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6600,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "e12cf0c4-a089-4b58-a68b-b7669e603e7a",
+                    "leftValue": "={{ $json.review_action }}",
+                    "rightValue": "Approve",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Approve"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "53def735-d683-4647-a08f-ee85310bb0b9",
+                    "leftValue": "={{ $json.review_action }}",
+                    "rightValue": "Reject",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Reject"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "13be5b6a-b77a-4219-a881-583a006fb34f",
+                    "leftValue": "={{ $json.review_action }}",
+                    "rightValue": "Request changes",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Request changes"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "90d41ce2-00b5-4b96-ab49-77782652335e",
+      "name": "Switch Review Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        6840,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONFLUENCE_BASE_URL }}/wiki/rest/api/content",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'page', title: $json.adr.title + ' (' + $json.adr.source_meeting + ')', space: { key: $env.CONFLUENCE_SPACE_KEY }, body: { storage: { value: $json.documents.confluence_storage, representation: 'storage' } } }) }}",
+        "options": {}
+      },
+      "id": "2a87204e-85d8-4fa6-a1d9-90b2460764b5",
+      "name": "Publish Confluence",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        40
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "atlassian-basic",
+          "name": "Atlassian API Token"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ parent: { database_id: $env.NOTION_DATABASE_ID }, properties: { [$env.NOTION_TITLE_PROPERTY || 'Name']: { title: [{ text: { content: $json.adr.title } }] } }, children: $json.documents.notion_children }) }}",
+        "options": {}
+      },
+      "id": "9952ee11-94f3-4984-a0f0-3cd3510ee948",
+      "name": "Publish Notion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "notion-header",
+          "name": "Notion API"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/issue/{{ $json.meeting.jira_epic_id }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: $json.documents.jira_adf }) }}",
+        "options": {}
+      },
+      "id": "4a17b9f7-0eb8-4f5b-a6f6-38ebc385340d",
+      "name": "Publish Jira Comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        360
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "atlassian-basic",
+          "name": "Atlassian API Token"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_PUBLISH_WEBHOOK_URL || $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':white_check_mark: ADR published after architect approval.\\n' + $json.documents.slack_mrkdwn }) }}",
+        "options": {}
+      },
+      "id": "a17e9cb4-3f2e-4fe4-a3fd-e9e27d63584d",
+      "name": "Notify Slack Published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        520
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TEAMS_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'ADR published: ' + $json.adr.title + ' [' + $json.adr.status + ']' }) }}",
+        "options": {}
+      },
+      "id": "094a774d-eba3-453d-a024-abcfe756c938",
+      "name": "Notify Teams Published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        680
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 5
+      },
+      "id": "4aad6198-4d6d-470c-a5cf-032e1a9b4593",
+      "name": "Merge Publish Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        7480,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst prepared = $('Parse Review Decision').first().json;\nconst results = $input.all().map((item) => item.json);\nreturn [{ json: { published: true, meeting_id: prepared.meeting.meeting_id, adr: prepared.adr, review_action: prepared.review_action, publish_results: results } }];\n"
+      },
+      "id": "12767fae-79fd-4ec6-af47-79e157c73345",
+      "name": "Summarize Publication",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7720,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':no_entry: ADR rejected by architect. Meeting ' + $json.adr.source_meeting + '. Comments: ' + ($json.review_comments || 'none') }) }}",
+        "options": {}
+      },
+      "id": "d160a7bd-2d22-4f84-aa33-fc2bc3448ba3",
+      "name": "Notify Rejected",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        860
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':pencil: Architect requested changes for ' + $json.adr.title + '. Comments: ' + ($json.review_comments || 'none') + '. Publication skipped.' }) }}",
+        "options": {}
+      },
+      "id": "98664450-6b7a-4cc0-a171-fc127cfb8963",
+      "name": "Notify Request Changes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7160,
+        1020
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Meeting Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Meeting Event": {
+      "main": [
+        [
+          {
+            "node": "Switch Transcript Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Transcript Source": {
+      "main": [
+        [
+          {
+            "node": "Parse Inline Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Transcript URL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Download Recording",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Transcript URL": {
+      "main": [
+        [
+          {
+            "node": "Parse Remote Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Recording": {
+      "main": [
+        [
+          {
+            "node": "Speech-to-Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Speech-to-Text": {
+      "main": [
+        [
+          {
+            "node": "Parse STT Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Inline Transcript": {
+      "main": [
+        [
+          {
+            "node": "Preprocess and Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Remote Transcript": {
+      "main": [
+        [
+          {
+            "node": "Preprocess and Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse STT Output": {
+      "main": [
+        [
+          {
+            "node": "Preprocess and Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preprocess and Chunk": {
+      "main": [
+        [
+          {
+            "node": "IF Has Jira Epic",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF Has Project Id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Has Jira Epic": {
+      "main": [
+        [
+          {
+            "node": "Fetch Jira Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Empty Jira Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Has Project Id": {
+      "main": [
+        [
+          {
+            "node": "Fetch Confluence Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Empty Confluence Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Jira Context": {
+      "main": [
+        [
+          {
+            "node": "Wrap Jira Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Empty Jira Context": {
+      "main": [
+        [
+          {
+            "node": "Wrap Jira Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Confluence Context": {
+      "main": [
+        [
+          {
+            "node": "Wrap Confluence Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Empty Confluence Context": {
+      "main": [
+        [
+          {
+            "node": "Wrap Confluence Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wrap Jira Result": {
+      "main": [
+        [
+          {
+            "node": "Merge Context Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wrap Confluence Result": {
+      "main": [
+        [
+          {
+            "node": "Merge Context Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Context Sources": {
+      "main": [
+        [
+          {
+            "node": "Assemble Context Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Context Package": {
+      "main": [
+        [
+          {
+            "node": "Split Chunks For Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Chunks For Extraction": {
+      "main": [
+        [
+          {
+            "node": "Requirements Extraction",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Constraints Extraction",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Alternatives Extraction",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Decisions Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Requirements": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Requirements Extraction",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Constraints": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Constraints Extraction",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Alternatives": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Alternatives Extraction",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Decisions": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Decisions Extraction",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Requirements Extraction": {
+      "main": [
+        [
+          {
+            "node": "Tag Requirements",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Constraints Extraction": {
+      "main": [
+        [
+          {
+            "node": "Tag Constraints",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alternatives Extraction": {
+      "main": [
+        [
+          {
+            "node": "Tag Alternatives",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decisions Extraction": {
+      "main": [
+        [
+          {
+            "node": "Tag Decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tag Requirements": {
+      "main": [
+        [
+          {
+            "node": "Merge Extraction Streams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tag Constraints": {
+      "main": [
+        [
+          {
+            "node": "Merge Extraction Streams",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Tag Alternatives": {
+      "main": [
+        [
+          {
+            "node": "Merge Extraction Streams",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Tag Decisions": {
+      "main": [
+        [
+          {
+            "node": "Merge Extraction Streams",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Merge Extraction Streams": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Reduce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Reduce": {
+      "main": [
+        [
+          {
+            "node": "Generate ADR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Generate ADR": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Generate ADR",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser ADR": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Generate ADR",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Autofix Parser": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Structured Output Parser ADR",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate ADR": {
+      "main": [
+        [
+          {
+            "node": "Parse Generated ADR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Generated ADR": {
+      "main": [
+        [
+          {
+            "node": "IF ADR JSON Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF ADR JSON Valid": {
+      "main": [
+        [
+          {
+            "node": "Validate ADR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry Generate ADR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Generate ADR": {
+      "main": [
+        [
+          {
+            "node": "Parse Retry ADR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Retry ADR": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Retry Generate ADR",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Retry ADR": {
+      "main": [
+        [
+          {
+            "node": "IF Retry JSON Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Retry JSON Valid": {
+      "main": [
+        [
+          {
+            "node": "Validate ADR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Invalid JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Invalid JSON": {
+      "main": [
+        [
+          {
+            "node": "Log Invalid JSON Stop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate ADR": {
+      "main": [
+        [
+          {
+            "node": "Prepare Review Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Review Package": {
+      "main": [
+        [
+          {
+            "node": "Notify Architect Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Architect Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Architect Slack": {
+      "main": [
+        [
+          {
+            "node": "Merge Review Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Architect Teams": {
+      "main": [
+        [
+          {
+            "node": "Merge Review Notifications",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Review Notifications": {
+      "main": [
+        [
+          {
+            "node": "Human Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Review": {
+      "main": [
+        [
+          {
+            "node": "Parse Review Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Review Decision": {
+      "main": [
+        [
+          {
+            "node": "Switch Review Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Review Action": {
+      "main": [
+        [
+          {
+            "node": "Publish Confluence",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Publish Notion",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Publish Jira Comment",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Slack Published",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Teams Published",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Request Changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Confluence": {
+      "main": [
+        [
+          {
+            "node": "Merge Publish Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Notion": {
+      "main": [
+        [
+          {
+            "node": "Merge Publish Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Publish Jira Comment": {
+      "main": [
+        [
+          {
+            "node": "Merge Publish Results",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Notify Slack Published": {
+      "main": [
+        [
+          {
+            "node": "Merge Publish Results",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Notify Teams Published": {
+      "main": [
+        [
+          {
+            "node": "Merge Publish Results",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "Merge Publish Results": {
+      "main": [
+        [
+          {
+            "node": "Summarize Publication",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "versionId": "3b6a6fdb-748f-4bb0-a18f-eb8b2ada2ad0",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "End-to-end meeting recording → Architecture Decision Record. LangChain extraction runs inside n8n. Human review is required before Confluence/Notion/Jira/Slack publication."
+  },
+  "pinData": {
+    "Webhook Trigger": [
+      {
+        "json": {
+          "meeting_id": "meeting-123",
+          "recording_url": "https://example.com/recordings/meeting-123.mp4",
+          "transcript": "Ada: We need SSO for all customer tenants.\nBob: Budget is capped at two engineers this quarter.\nAda: We compared REST and GraphQL.\nBob: We decided to go with REST for the public API.\nAda: Open question — how do we version the API?\nBob: Risk is that GraphQL fans will push back.",
+          "participants": [
+            {
+              "id": "Ada",
+              "name": "Ada Lovelace",
+              "email": "ada@example.com"
+            },
+            {
+              "id": "Bob",
+              "name": "Bob Architect",
+              "email": "bob@example.com"
+            }
+          ],
+          "start_time": "2026-09-16T10:00:00Z",
+          "project_id": "PAY",
+          "jira_epic_id": "PAY-100",
+          "title": "Payments architecture decision"
+        }
+      }
+    ]
+  },
+  "tags": [
+    {
+      "name": "adr"
+    },
+    {
+      "name": "architecture"
+    },
+    {
+      "name": "langchain"
+    }
+  ]
+}

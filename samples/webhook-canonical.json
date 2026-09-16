@@ -1,0 +1,13 @@
+{
+  "meeting_id": "meeting-123",
+  "recording_url": "https://example.com/recordings/meeting-123.mp4",
+  "transcript": "Ada: We need SSO for all customer tenants.\nBob: Budget is capped at two engineers this quarter.\nAda: We compared REST and GraphQL.\nBob: We decided to go with REST for the public API.\nAda: Open question — how do we version the API?\nBob: Risk is that GraphQL fans will push back.",
+  "participants": [
+    { "id": "Ada", "name": "Ada Lovelace", "email": "ada@example.com" },
+    { "id": "Bob", "name": "Bob Architect", "email": "bob@example.com" }
+  ],
+  "start_time": "2026-09-16T10:00:00Z",
+  "project_id": "PAY",
+  "jira_epic_id": "PAY-100",
+  "title": "Payments architecture decision"
+}

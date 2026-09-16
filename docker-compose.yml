@@ -1,0 +1,24 @@
+services:
+  n8n:
+    image: n8nio/n8n:1.82.3
+    ports:
+      - "5678:5678"
+    env_file:
+      - .env
+    environment:
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Europe/Moscow}
+      N8N_SECURE_COOKIE: "false"
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/import:ro
+    # After start: n8n UI → Workflows → Import from File → /import is not mounted into the UI.
+    # Import n8n/workflows/adr-generation-pipeline.json from the host, then bind credentials.
+
+volumes:
+  n8n_data:

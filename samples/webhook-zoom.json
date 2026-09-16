@@ -1,0 +1,26 @@
+{
+  "event": "recording.completed",
+  "payload": {
+    "object": {
+      "uuid": "zoom-uuid-meeting-123",
+      "id": 987654321,
+      "topic": "Payments architecture decision",
+      "start_time": "2026-09-16T10:00:00Z",
+      "recording_files": [
+        {
+          "file_type": "MP4",
+          "download_url": "https://zoom.us/rec/play/example.mp4"
+        },
+        {
+          "file_type": "M4A",
+          "download_url": "https://zoom.us/rec/play/example.m4a"
+        }
+      ],
+      "participants": [
+        { "user_id": "Ada", "name": "Ada Lovelace", "email": "ada@example.com" }
+      ]
+    }
+  },
+  "project_id": "PAY",
+  "jira_epic_id": "PAY-100"
+}
